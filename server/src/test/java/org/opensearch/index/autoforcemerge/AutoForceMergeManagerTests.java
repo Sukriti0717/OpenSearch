@@ -31,6 +31,8 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.SegmentsStats;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
+import org.opensearch.index.store.Store;
+import org.opensearch.index.store.StoreStats;
 import org.opensearch.index.translog.TranslogStats;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.monitor.MonitorService;
@@ -40,6 +42,9 @@ import org.opensearch.monitor.jvm.JvmService;
 import org.opensearch.monitor.jvm.JvmStats;
 import org.opensearch.monitor.os.OsService;
 import org.opensearch.monitor.os.OsStats;
+import org.opensearch.telemetry.metrics.Counter;
+import org.opensearch.telemetry.metrics.Histogram;
+import org.opensearch.telemetry.metrics.MetricsRegistry;
 import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.ThreadPool;
@@ -61,6 +66,9 @@ import java.util.concurrent.Executors;
 import static org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING;
 import static org.opensearch.index.IndexSettingsTests.newIndexMeta;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -81,6 +89,7 @@ public class AutoForceMergeManagerTests extends OpenSearchTestCase {
     private OsStats.Cpu cpu;
     private FsInfo.Path disk;
     private JvmStats.Mem jvm;
+    private AutoForceMergeMetrics autoForceMergeMetrics;
 
     private final String DATA_NODE_1 = "DATA_NODE_1";
     private final String DATA_NODE_2 = "DATA_NODE_2";
@@ -104,6 +113,15 @@ public class AutoForceMergeManagerTests extends OpenSearchTestCase {
         osService = mock(OsService.class);
         fsService = mock(FsService.class);
         jvmService = mock(JvmService.class);
+
+        MetricsRegistry metricsRegistry = mock(MetricsRegistry.class);
+        Histogram mockHistogram = mock(Histogram.class);
+        Counter mockCounter = mock(Counter.class);
+
+        when(metricsRegistry.createHistogram(anyString(), anyString(), anyString())).thenReturn(mockHistogram);
+        when(metricsRegistry.createCounter(anyString(), anyString(), anyString())).thenReturn(mockCounter);
+
+        autoForceMergeMetrics = new AutoForceMergeMetrics(metricsRegistry);
 
         when(monitorService.osService()).thenReturn(osService);
         when(monitorService.fsService()).thenReturn(fsService);
@@ -313,6 +331,59 @@ public class AutoForceMergeManagerTests extends OpenSearchTestCase {
         when(shard.state()).thenReturn(IndexShardState.RECOVERING);
         assertFalse(autoForceMergeManager.getShardValidator().validate(shard).isAllowed());
         autoForceMergeManager.close();
+    }
+
+    public void testShardSizeMetricRecording() throws IOException {
+        DiscoveryNode dataNode1 = getNodeWithRoles(DATA_NODE_1, Set.of(DiscoveryNodeRole.DATA_ROLE));
+        DiscoveryNode warmNode1 = getNodeWithRoles(WARM_NODE_1, Set.of(DiscoveryNodeRole.WARM_ROLE));
+        ClusterState clusterState = ClusterState.builder(new ClusterName(ClusterServiceUtils.class.getSimpleName()))
+            .nodes(
+                DiscoveryNodes.builder()
+                    .add(dataNode1)
+                    .add(warmNode1)
+                    .localNodeId(dataNode1.getId())
+                    .clusterManagerNodeId(dataNode1.getId())
+            )
+            .blocks(ClusterBlocks.EMPTY_CLUSTER_BLOCK)
+            .build();
+        when(clusterService.state()).thenReturn(clusterState);
+        when(cpu.getPercent()).thenReturn((short) 50);
+        when(jvm.getHeapUsedPercent()).thenReturn((short) 50);
+
+        int forceMergeThreads = 4;
+        ExecutorService executorService = Executors.newFixedThreadPool(forceMergeThreads);
+        when(threadPool.executor(ThreadPool.Names.FORCE_MERGE)).thenReturn(executorService);
+        ThreadPoolStats stats = new ThreadPoolStats(
+            Arrays.asList(new ThreadPoolStats.Stats(ThreadPool.Names.FORCE_MERGE, forceMergeThreads, 0, 0, 0, forceMergeThreads, 0, -1))
+        );
+        when(threadPool.stats()).thenReturn(stats);
+
+        IndexService indexService1 = mock(IndexService.class);
+        TranslogStats translogStats = new TranslogStats(0, 0, 0, 0, TimeValue.timeValueSeconds(6).getMillis());
+        IndexShard shard1 = getShard(TEST_INDEX_1, translogStats, 2);
+
+        Store mockStore = mock(Store.class);
+        StoreStats mockStoreStats = mock(StoreStats.class);
+        when(shard1.store()).thenReturn(mockStore);
+        when(mockStore.stats(anyLong())).thenReturn(mockStoreStats);
+        when(mockStoreStats.sizeInBytes()).thenReturn(1024L);
+
+        List<IndexShard> indexShards1 = List.of(shard1);
+        when(indexService1.spliterator()).thenReturn(indexShards1.spliterator());
+        List<IndexService> indexServices = List.of(indexService1);
+        when(indicesService.spliterator()).thenReturn(indexServices.spliterator());
+
+        AutoForceMergeManager autoForceMergeManager = clusterSetupWithNode(
+            getConfiguredClusterSettings(true, true, Collections.emptyMap()),
+            dataNode1
+        );
+        autoForceMergeManager.start();
+        autoForceMergeManager.getTask().runInternal();
+
+        verify(autoForceMergeMetrics.shardSize, times(1)).add(eq(1024.0), any());
+
+        autoForceMergeManager.close();
+        executorService.shutdown();
     }
 
     public void testShardValidatorWithForbiddenAutoForceMergesSetting() {
@@ -563,7 +634,8 @@ public class AutoForceMergeManagerTests extends OpenSearchTestCase {
             threadPool,
             monitorService,
             indicesService,
-            clusterService
+            clusterService,
+            autoForceMergeMetrics
         );
     }
 
@@ -573,6 +645,16 @@ public class AutoForceMergeManagerTests extends OpenSearchTestCase {
         SegmentsStats segmentsStats = new SegmentsStats();
         segmentsStats.add(segmentCount);
         ShardRouting shardRouting = mock(ShardRouting.class);
+
+        Store mockStore = mock(Store.class);
+        StoreStats mockStoreStats = mock(StoreStats.class);
+        when(mockStoreStats.sizeInBytes()).thenReturn(1024L);
+        try {
+            when(mockStore.stats(anyLong())).thenReturn(mockStoreStats);
+        } catch (IOException e) {
+            throw new RuntimeException("Unexpected IOException in mock setup", e);
+        }
+
         when(shard.shardId()).thenReturn(shardId1);
         when(shard.translogStats()).thenReturn(translogStats);
         when(shard.segmentStats(false, false)).thenReturn(segmentsStats);
@@ -580,6 +662,7 @@ public class AutoForceMergeManagerTests extends OpenSearchTestCase {
         when(shardRouting.primary()).thenReturn(true);
         when(shard.state()).thenReturn(IndexShardState.STARTED);
         when(shard.indexSettings()).thenReturn(getNewIndexSettings(TEST_INDEX_1));
+        when(shard.store()).thenReturn(mockStore);
         return shard;
     }
 
